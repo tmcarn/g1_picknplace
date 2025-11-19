@@ -11,7 +11,7 @@ class G1Env(gym.Env):
     def __init__(self, render_mode='human', render_fps=30, policy_feq=50, ): # 50 Hz 
         super().__init__()
         
-        xml_path = "g1_picknplace_controller/unitree_g1/g1_mocap_29dof_with_hands.xml"
+        xml_path = "unitree_g1/g1_mocap_29dof_with_hands.xml"
         
         # Select a graphics backend for the viewer
         os.environ.setdefault("MUJOCO_GL", "glfw")
