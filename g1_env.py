@@ -8,7 +8,7 @@ import time
 
 
 class G1Env(gym.Env):
-    def __init__(self, render_mode='human', render_fps=30, policy_feq=50, ): # 50 Hz 
+    def __init__(self, render_mode='human', render_fps=30, policy_feq=50, external_load_kg: float = 0.0): # 50 Hz 
         super().__init__()
         
         xml_path = "unitree_g1/g1_mocap_29dof_with_hands.xml"
@@ -92,25 +92,50 @@ class G1Env(gym.Env):
         self.init_qvel = self.data.qvel.copy()
 
         # Perturbation Noise
-        self.reset_noise = 0.01
+        self.reset_noise = 0.005  # Reduced noise for easier learning
 
         # Reward Parameters
-        self.min_reward_height = 0.75 # meters
-        self.min_term_height = 0.5
+        self.min_reward_height = 0.70 # meters (slightly lower threshold)
+        self.min_term_height = 0.4  # Lower termination threshold
         
-        term_tilt_angle = 30 # degrees
+        term_tilt_angle = 45 # degrees (more tolerant)
         self.term_tilt_tresh = self.calculate_tilt_thresh(term_tilt_angle)
 
         # Environment Constants
         self.up_vector = np.array([0, 0, 1])
         self.gravity = np.array([0,0,-9.81])
         self.box_mass = 10 #kg
+        self.external_load_mass = max(external_load_kg, 0.0)
 
         # Render 
         self.viewer = None
         self.render_mode = render_mode
         self.render_fps = render_fps
         self.render_dt = 1.0 / self.render_fps
+
+        # Symmetry Reward - using qpos indices (skip floating base at 0-6)
+        # Left leg joints in qpos: 7-12
+        # Right leg joints in qpos: 13-18
+        # Left arm joints in qpos: 22-25 (shoulder pitch/roll/yaw, elbow)
+        # Right arm joints in qpos: 36-39 (shoulder pitch/roll/yaw, elbow)
+        self.left_leg_qpos_indices = [7, 8, 9, 10, 11, 12]
+        self.right_leg_qpos_indices = [13, 14, 15, 16, 17, 18]
+        self.left_arm_qpos_indices = [22, 23, 24, 25]
+        self.right_arm_qpos_indices = [36, 37, 38, 39]
+
+        # Velocity indices are offset by 6 for the floating base
+        # Left leg in qvel: 6-11
+        # Right leg in qvel: 12-17
+        # Left arm in qvel: 21-24
+        # Right arm in qvel: 35-38
+        self.left_leg_qvel_indices = [6, 7, 8, 9, 10, 11]
+        self.right_leg_qvel_indices = [12, 13, 14, 15, 16, 17]
+        self.left_arm_qvel_indices = [21, 22, 23, 24]
+        self.right_arm_qvel_indices = [35, 36, 37, 38]
+
+        # Freeze Hand DOFs
+        self.wrist_and_hand_actuators = list(range(19, 29)) + list(range(33, 43))
+
 
     
     def calculate_tilt_thresh(self, tilt_degrees):
@@ -129,73 +154,111 @@ class G1Env(gym.Env):
     def get_obs_limits(self):
         """Get observation space limits from model."""
         
-        # Torso position: no strict limits (can move anywhere)
-        pos_low = np.full(3, -np.inf)
-        pos_high = np.full(3, np.inf)
+        # Position limits for all qpos (including robot + box)
+        # For free joints (robot and box): position is unbounded, quaternion is normalized
+        qpos_low = np.full(self.nq, -np.inf)
+        qpos_high = np.full(self.nq, np.inf)
         
-        # Quaternion: normalized, so each component in [-1, 1]
-        quat_low = np.full(4, -1.0)
-        quat_high = np.full(4, 1.0)
+        # Set limits for actuated joints (indices 7 to 49 for robot joints, excluding floating base at 0-6 and box at 50-56)
+        for i in range(1, self.model.njnt):  # Skip first freejoint (robot base)
+            joint_type = self.model.jnt_type[i]
+            if joint_type == 3:  # Hinge joint
+                qpos_addr = self.model.jnt_qposadr[i]
+                qpos_low[qpos_addr] = self.model.jnt_range[i, 0]
+                qpos_high[qpos_addr] = self.model.jnt_range[i, 1]
         
-        # Joint positions: skip free joint (index 0)
-        joint_pos_low = self.model.jnt_range[1:, 0]  # Shape: (n_joints-1,)
-        joint_pos_high = self.model.jnt_range[1:, 1]
+        # Quaternions should be in [-1, 1] for both robot and box
+        qpos_low[3:7] = -1.0  # Robot quaternion
+        qpos_high[3:7] = 1.0
+        if self.nq >= 54:  # If box exists
+            qpos_low[50:54] = -1.0  # Box quaternion
+            qpos_high[50:54] = 1.0
         
-        # Velocities - need to match the structure of get_obs()
-        # Torso linear velocity (3)
-        vel_low = np.full(3, -10.0)  # m/s
-        vel_high = np.full(3, 10.0)
-        
-        # Torso angular velocity (3)
-        ang_vel_low = np.full(3, -10.0)  # rad/s
-        ang_vel_high = np.full(3, 10.0)
-        
-        # Joint velocities: skip free joint DOFs (first 6)
-        # Free joint has 6 velocity DOFs: 3 linear + 3 angular
-        joint_vel_low = np.full(self.nv - 6, -20.0)  # rad/s
-        joint_vel_high = np.full(self.nv - 6, 20.0)
+        # Velocity limits for all qvel (including robot + box)
+        qvel_low = np.full(self.nv, -20.0)
+        qvel_high = np.full(self.nv, 20.0)
         
         # Concatenate all limits - MUST match order in get_obs()
         obs_low = np.concatenate([
-            pos_low,           # 3
-            quat_low,          # 4
-            joint_pos_low,     # nq - 7
-            vel_low,           # 3
-            ang_vel_low,       # 3
-            joint_vel_low,     # nv - 6
+            qpos_low,
+            qvel_low,
         ]).astype(np.float64)
         
         obs_high = np.concatenate([
-            pos_high,          # 3
-            quat_high,         # 4
-            joint_pos_high,    # nq - 7
-            vel_high,          # 3
-            ang_vel_high,      # 3
-            joint_vel_high,    # nv - 6
+            qpos_high,
+            qvel_high,
         ]).astype(np.float64)
         
         return obs_low, obs_high
 
     def calculate_reward(self):
         '''
-        Simple Reward Policy for Humanoid Ballancing
+        Improved Reward Policy for Humanoid Standing
         Reward:
-        - Torso Height (Z position)
-        - Upright Torso Orientation (distance beween normal vector and torso z axis)
+        - Torso Height (Z position) - increased weight
+        - Upright Torso Orientation (distance between normal vector and torso z axis) - increased weight
+        - Stability (penalize high velocities)
+        - Symmetry Reward
+        - Motion Reference Reward
+        - Support Polygon Reward
 
         Cost:
-        - Penalize Expensive Actions
+        - Penalize Expensive Actions (but less harsh)
         '''
-        # Torso height (penalize falling)
+        # Torso height reward (stronger signal)
         height = self.data.qpos[2]
-        height_reward = 1.5 if height > self.min_reward_height else 0.0
+        # Continuous height reward instead of binary
+        target_height = 0.95  # Target standing height
+        height_reward = 5.0 * max(0, 1.0 - abs(height - target_height))
 
-        upright_reward = 1.5 * self.get_tilt()
+        # Upright orientation reward (stronger signal)
+        upright_reward = 5.0 * self.get_tilt()
 
-        # Control Cost (Penalizes Large Actions)
-        ctrl_cost = -1 * np.sum(np.square(self.data.ctrl))
+        # Stability reward - penalize high velocities
+        velocity_penalty = -0.01 * np.sum(np.square(self.data.qvel))
 
-        total_reward = height_reward + upright_reward + ctrl_cost
+        # Control Cost (less harsh, only penalize extreme actions)
+        ctrl_cost = -0.001 * np.sum(np.square(self.data.ctrl))
+
+        # --- Symmetry Reward ---
+        # Arms
+        left_arm_qpos = self.data.qpos[self.left_arm_qpos_indices]
+        right_arm_qpos = self.data.qpos[self.right_arm_qpos_indices]
+        arm_pos_diff = np.sum(np.square(left_arm_qpos - right_arm_qpos))
+
+        left_arm_qvel = self.data.qvel[self.left_arm_qvel_indices]
+        right_arm_qvel = self.data.qvel[self.right_arm_qvel_indices]
+        arm_vel_diff = np.sum(np.square(left_arm_qvel - right_arm_qvel))
+
+        # Legs
+        left_leg_qpos = self.data.qpos[self.left_leg_qpos_indices]
+        right_leg_qpos = self.data.qpos[self.right_leg_qpos_indices]
+        leg_pos_diff = np.sum(np.square(left_leg_qpos - right_leg_qpos))
+
+        left_leg_qvel = self.data.qvel[self.left_leg_qvel_indices]
+        right_leg_qvel = self.data.qvel[self.right_leg_qvel_indices]
+        leg_vel_diff = np.sum(np.square(left_leg_qvel - right_leg_qvel))
+
+        symmetry_reward = -0.1 * (arm_pos_diff + arm_vel_diff + leg_pos_diff + leg_vel_diff)
+
+        # --- Motion Reference Reward ---
+        qpos_deviation = np.sum(np.square(self.data.qpos - self.init_qpos))
+        motion_ref_reward = -0.2 * qpos_deviation
+
+        # --- Support Polygon Reward ---
+        com_pos = self.data.subtree_com[0, :2]
+        left_foot_pos = self.data.site_xpos[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, 'left_foot')][:2]
+        right_foot_pos = self.data.site_xpos[mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, 'right_foot')][:2]
+        
+        foot_center = (left_foot_pos + right_foot_pos) / 2.0
+        com_dist_from_center = np.linalg.norm(com_pos - foot_center)
+        support_polygon_reward = -0.5 * com_dist_from_center
+
+        # Bonus for staying alive
+        alive_bonus = 1.0
+
+        total_reward = (height_reward + upright_reward + velocity_penalty + ctrl_cost + 
+                        symmetry_reward + motion_ref_reward + support_polygon_reward + alive_bonus)
         
         return total_reward
     
@@ -208,8 +271,11 @@ class G1Env(gym.Env):
         return np.dot(torso_z_axis, self.up_vector)
     
     def apply_force(self):
-        box_force = self.gravity * self.box_mass # F = ma
-        force_per_hand = box_force / 2
+        if self.external_load_mass <= 0:
+            return
+            
+        load_force = self.gravity * self.external_load_mass # F = ma (vector)
+        force_per_hand = load_force / 2
 
         hand_names = ["left_wrist_yaw_link", "right_wrist_yaw_link"]
         for hand_name in hand_names:
@@ -277,9 +343,13 @@ class G1Env(gym.Env):
         
         # Apply action (as control signal)
         self.data.ctrl[:] = action
+        # Freeze hand and wrist DOFs
+        self.data.ctrl[self.wrist_and_hand_actuators] = 0
 
-        self.apply_force()
-        
+        # Apply external load if configured
+        if self.external_load_mass > 0:
+            self.apply_force()
+
         # Step through physics multiple times with same action (frame skip)
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
@@ -298,6 +368,10 @@ class G1Env(gym.Env):
             'height': self.data.qpos[2],
             'reward': reward,
         }
+        
+        # Render if in human mode
+        if self.render_mode == "human":
+            self.render()
         
         return obs, reward, terminate, truncated, info
     
