@@ -207,7 +207,7 @@ class G1Env(gym.Env):
         torso_z_axis = rotation_matrix[6:9]
         return np.dot(torso_z_axis, self.up_vector)
     
-    def apply_force(self):
+    def apply_extern_force(self):
         box_force = self.gravity * self.box_mass # F = ma
         force_per_hand = box_force / 2
 
@@ -230,6 +230,23 @@ class G1Env(gym.Env):
                 body_id,             # Body ID
                 self.data.qfrc_applied  # Output array
             )
+
+    def check_contacts(self):
+        # Check all active contacts
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            
+            # Get bodies in contact
+            geom1 = contact.geom1
+            geom2 = contact.geom2
+            body1 = self.model.geom_bodyid[geom1]
+            body2 = self.model.geom_bodyid[geom2]
+            
+            # Check if ground contact (one geom should be ground)
+            geom1_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom1)
+            geom2_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom2)
+
+            print(f"Contact {i}: Between {geom1_name} and {geom2_name}")
             
 
     def terminate(self):
@@ -269,6 +286,8 @@ class G1Env(gym.Env):
     def step(self, action):
         """Take a step in the environment"""
 
+        self.check_contacts()
+
         # Clear forces from previous step
         self.data.qfrc_applied[:] = 0
 
@@ -278,7 +297,7 @@ class G1Env(gym.Env):
         # Apply action (as control signal)
         self.data.ctrl[:] = action
 
-        self.apply_force()
+        self.apply_extern_force()
         
         # Step through physics multiple times with same action (frame skip)
         for _ in range(self.frame_skip):

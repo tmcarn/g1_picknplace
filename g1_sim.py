@@ -10,7 +10,7 @@ import os
 
 # Define Run Name
 timestamp = datetime.now().strftime("%d_%H:%M:%S")
-n_steps = 10_000_000
+n_steps = 1
 run_name = f"g1_standing_{n_steps}_steps_{timestamp}"
 
 # Log Directory
