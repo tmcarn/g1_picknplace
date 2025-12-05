@@ -83,6 +83,9 @@ class SimpleMPCBalance:
         keyframe_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
         self.data.qpos[:] = self.model.key_qpos[keyframe_id]
         self.data.qvel[:] = self.model.key_qvel[keyframe_id]
+
+        self.data.qvel[:] = 0 
+
         mujoco.mj_forward(self.model, self.data)
         print("Loaded in 'stand' keyframe as initial position")
 
@@ -96,7 +99,7 @@ class SimpleMPCBalance:
         # Environmental Constants
         self.norm_vec = np.array([0, 0, 1])
         self.gravity = np.array([0,0,-9.81])
-        self.box_mass = 1 #kg
+        self.box_mass = 5 #kg
 
         # Use initial state as desired state
         self.x_desired = self.get_state()
@@ -118,7 +121,6 @@ class SimpleMPCBalance:
         self.contact_data = self.get_contacts()
 
         self.reset_noise = 0.01
-        self.reset()
 
     def state_transition_model(self, x):
         '''
@@ -200,7 +202,7 @@ class SimpleMPCBalance:
         cost = 0
         constraints = []
 
-        # required_fz = 45 * 9.81
+        required_fz = 45 * 9.81
 
         # Initial state constraint
         constraints.append(x[0] == x0)
@@ -213,6 +215,16 @@ class SimpleMPCBalance:
 
             # total_fz = u[k][2] + u[k][5]
             # cost += 100000.0 * cp.square(total_fz - required_fz)
+
+            # # Fx and Fy Bounds
+            # constraints.append(u[k][0] >= -50)   # Fx limits (was probably unbounded)
+            # constraints.append(u[k][0] <= 50)
+            # constraints.append(u[k][1] >= -50)   # Fy limits
+            # constraints.append(u[k][1] <= 50)
+
+            # # Moment Bounds
+            # constraints.append(u[k][6:10] >= -20)  # Tighter moment limits
+            # constraints.append(u[k][6:10] <= 20)
 
             # ===== DYNAMIC CONSTRAINTS =====
             x_dot = A @ x[k] + B @ u[k]
@@ -257,232 +269,57 @@ class SimpleMPCBalance:
 
         problem.solve(solver=cp.OSQP, verbose=False)
 
+        print("MPC Complete")
+
         return u[0].value
     
-    # def compute_joint_torques_from_forces(self, F_desired):
-    #     """
-    #     Convert desired contact forces to joint torques using inverse dynamics
-    #     """
-    #     nv = self.model.nv  # 6 (floating base) + 12 (legs) + ... = total DOFs
+    def calculate_q_ddot_des(self):
+        x = self.get_state()
         
-    #     # Get contact Jacobians (translational AND rotational)
-    #     jac_left_trans = np.zeros((3, nv))
-    #     jac_left_rot = np.zeros((3, nv))
-    #     jac_right_trans = np.zeros((3, nv))
-    #     jac_right_rot = np.zeros((3, nv))
+        theta_curr = x[0:3]
+        p_com_curr = x[3:6]
+        omega_curr = x[6:9]
+        p_com_dot_curr = x[9:12]
         
-    #     left_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
-    #     right_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "right_foot")
+        # Desired state (from MPC)
+        theta_des = self.x_desired[0:3]
+        p_com_des = self.x_desired[3:6]
         
-    #     # Get both translational and rotational Jacobians
-    #     mujoco.mj_jacSite(self.model, self.data, jac_left_trans, jac_left_rot, left_foot_site)
-    #     mujoco.mj_jacSite(self.model, self.data, jac_right_trans, jac_right_rot, right_foot_site)
+        # MUCH LOWER GAINS - Your gains are WAY too high!
+        Kp_com = 5.0       # Down from 100
+        Kd_com = 10.0      # Down from 50
+        Kp_orient = 2.0    # Down from 50
+        Kd_orient = 5.0    # Down from 20
         
-    #     # Extract forces and moments (6D wrenches)
-    #     F_left = F_desired[:3]      # [fx, fy, fz]
-    #     M_left = F_desired[3:6]     # [mx, my, mz]
-    #     F_right = F_desired[6:9]    # [fx, fy, fz]
-    #     M_right = F_desired[9:12]   # [mx, my, mz]
+        # Errors (for debugging)
+        e_com = p_com_des - p_com_curr
+        e_theta = theta_des - theta_curr
         
-    #     print(f"F_left: {F_left}, M_left: {M_left}")
-    #     print(f"F_right: {F_right}, M_right: {M_right}")
-
-    #     print(f"qfrc_bias (all): {self.data.qfrc_bias}")
-    #     print(f"qfrc_bias legs [6:18]: {self.data.qfrc_bias[6:18]}")
-    #     print(f"Robot mass: {np.sum(self.model.body_mass)} kg")
-    #     print(f"Base height: {self.data.qpos[2]} m")
+        # PD control (zero desired velocities)
+        p_ddot_des = Kp_com * e_com - Kd_com * p_com_dot_curr
+        omega_ddot_des = Kp_orient * e_theta - Kd_orient * omega_curr
         
-    #     # Compute torques from contact forces AND moments
-    #     tau_contacts = (jac_left_trans.T @ F_left + jac_left_rot.T @ M_left + 
-    #                     jac_right_trans.T @ F_right + jac_right_rot.T @ M_right)
+        # Add joint damping
+        q_dot = self.data.qvel.copy()
+        joint_damping = -20.0 * q_dot  # Increased from -10
         
-    #     # Add gravity and Coriolis compensation
-    #     tau_total = self.data.qfrc_bias.copy() - tau_contacts
+        # Full state
+        q_ddot_des = np.zeros(self.model.nv)
+        q_ddot_des[0:3] = p_ddot_des
+        q_ddot_des[3:6] = omega_ddot_des
+        q_ddot_des += joint_damping
         
-    #     # Extract leg joint torques (skip 6 DOF floating base)
-    #     tau_legs = tau_total[6:18]
+        # CRITICAL: CLIP TO PREVENT EXPLOSION
+        max_accel = 2.0  # rad/s² or m/s²
+        q_ddot_des = np.clip(q_ddot_des, -max_accel, max_accel)
         
-    #     print(f"Computed torques: {tau_legs}")
-    #     print(f"Max torque: {np.max(np.abs(tau_legs)):.2f} Nm")
+        print(f"COM Error: {e_com}")
+        print(f"Theta Error: {e_theta}")
+        print(f"COM_VEL Error: {p_com_dot_curr}")
+        print(f"Omega Error: {omega_curr}")
         
-    #     # Clip to actuator limits
-    #     tau_legs = np.clip(tau_legs, 
-    #                     [-88, -139, -88, -139, -50, -50,
-    #                         -88, -139, -88, -139, -50, -50],
-    #                     [88, 139, 88, 139, 50, 50,
-    #                         88, 139, 88, 139, 50, 50])
-        
-    #     return tau_legs
-        
-    # def compute_joint_torques_from_forces(self, F_desired):
-    #     """
-    #     Compute feedforward torques from MPC forces, plus PD stabilization
-    #     """
-    #     mujoco.mj_forward(self.model, self.data)
-        
-    #     nv = self.model.nv
-        
-    #     # Get Jacobians
-    #     jac_left_trans = np.zeros((3, nv))
-    #     jac_right_trans = np.zeros((3, nv))
-        
-    #     left_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
-    #     right_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "right_foot")
-        
-    #     mujoco.mj_jacSite(self.model, self.data, jac_left_trans, None, left_foot_site)
-    #     mujoco.mj_jacSite(self.model, self.data, jac_right_trans, None, right_foot_site)
-        
-    #     F_left = F_desired[:3]
-    #     F_right = F_desired[6:9]
-        
-    #     # Feedforward from contact forces
-    #     tau_ff = jac_left_trans.T @ F_left + jac_right_trans.T @ F_right
-    #     tau_ff_legs = tau_ff[6:18]
-        
-    #     # PD feedback to stabilize around standing pose
-    #     q_des = self.init_qpos[7:19]  # Desired leg joint positions
-    #     q_curr = self.data.qpos[7:19]  # Current leg joint positions
-    #     qd_curr = self.data.qvel[6:18]  # Current leg joint velocities
-        
-    #     kp = 100.0  # Position gain
-    #     kd = 20.0   # Velocity gain
-        
-    #     tau_fb = kp * (q_des - q_curr) - kd * qd_curr
-        
-    #     # Total torque = feedforward + feedback
-    #     tau_total = tau_ff_legs + tau_fb
-        
-    #     print(f"tau_ff: {tau_ff_legs[:3]}")
-    #     print(f"tau_fb: {tau_fb[:3]}")
-    #     print(f"tau_total: {tau_total[:3]}")
-        
-    #     tau_total = np.clip(tau_total,
-    #                         [-88, -139, -88, -139, -50, -50,
-    #                         -88, -139, -88, -139, -50, -50],
-    #                         [88, 139, 88, 139, 50, 50,
-    #                         88, 139, 88, 139, 50, 50])
-        
-    #     return tau_total
-        
-    # def compute_joint_torques_from_forces(self, F_desired):
-    #     """
-    #     Proper inverse dynamics using MuJoCo
-    #     """
-    #     # Update forward dynamics first
-    #     mujoco.mj_forward(self.model, self.data)
-        
-    #     # Apply external forces at feet
-    #     left_foot_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link")
-    #     right_foot_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link")
-        
-    #     # Extract forces and moments
-    #     F_left = F_desired[:3]
-    #     M_left = F_desired[3:6]
-    #     F_right = F_desired[6:9]
-    #     M_right = F_desired[9:12]
-        
-    #     # Apply as external forces (in world frame)
-    #     # xfrc_applied is [fx, fy, fz, mx, my, mz] per body
-    #     self.data.xfrc_applied[left_foot_body] = np.concatenate([F_left, M_left])
-    #     self.data.xfrc_applied[right_foot_body] = np.concatenate([F_right, M_right])
-
-    #     box_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "box")
-    #     box_weight = np.array([0, 0, self.box_mass * -9.81, 0, 0, 0])  # 5kg downward
-        
-    #     self.data.xfrc_applied[box_body] = box_weight
-        
-    #     # Compute required actuator forces using inverse dynamics
-    #     # This computes: M(q)*qacc + C(q,qvel) = tau + J^T*F_ext
-    #     # Solving for tau given qacc=0 and F_ext
-    #     mujoco.mj_inverse(self.model, self.data)
-        
-    #     # qfrc_inverse now contains required generalized forces
-    #     tau_required = self.data.qfrc_inverse.copy()
-        
-    #     # Extract leg and waist joint torques
-    #     tau_all = tau_required[6:]
-        
-    #     print(f"Applied forces - Left: {F_left}, Right: {F_right}")
-    #     print(f"qfrc_inverse legs: {tau_all}")
-    #     print(f"Max torque: {np.max(np.abs(tau_all)):.2f} Nm")
-        
-    #     # Clear external forces for next iteration
-    #     self.data.xfrc_applied[:] = 0
-        
-    #     return tau_all   
+        return q_ddot_des
     
-    # def compute_joint_torques_from_forces(self, F_desired):
-    #     """
-    #     Compute feedforward torques from contact forces + PD stabilization
-    #     """
-    #     mujoco.mj_forward(self.model, self.data)
-        
-    #     nv = self.model.nv
-        
-    #     # Get foot Jacobians
-    #     jac_left_trans = np.zeros((3, nv))
-    #     jac_left_rot = np.zeros((3, nv))
-    #     jac_right_trans = np.zeros((3, nv))
-    #     jac_right_rot = np.zeros((3, nv))
-        
-    #     left_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
-    #     right_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "right_foot")
-        
-    #     mujoco.mj_jacSite(self.model, self.data, jac_left_trans, jac_left_rot, left_foot_site)
-    #     mujoco.mj_jacSite(self.model, self.data, jac_right_trans, jac_right_rot, right_foot_site)
-        
-    #     # Extract forces
-    #     F_left = F_desired[:3]
-    #     M_left = F_desired[3:6]
-    #     F_right = F_desired[6:9]
-    #     M_right = F_desired[9:12]
-        
-    #     # Feedforward torques from contact forces
-    #     tau_contacts = (jac_left_trans.T @ F_left + jac_left_rot.T @ M_left + 
-    #                     jac_right_trans.T @ F_right + jac_right_rot.T @ M_right)
-        
-    #     # Gravity compensation
-    #     tau_gravity = self.data.qfrc_bias.copy()
-        
-    #     # Feedforward component
-    #     tau_ff = -tau_gravity + tau_contacts
-    #     tau_ff_actuated = tau_ff[6:]
-        
-    #     # PD Feedback to stabilize around keyframe pose
-    #     q_des = self.init_qpos[7:]  # Desired joint positions (all joints)
-    #     q_curr = self.data.qpos[7:]  # Current joint positions
-    #     qd_curr = self.data.qvel[6:]  # Current joint velocities
-        
-    #     # Different gains for different joint groups
-    #     kp = np.zeros(self.model.nu)
-    #     kd = np.zeros(self.model.nu)
-        
-    #     # Legs (0-11): Moderate stiffness
-    #     kp[0:12] = 50.0
-    #     kd[0:12] = 10.0
-        
-    #     # Waist (12-14): Lower stiffness to allow MPC to move it
-    #     kp[12:15] = 20.0
-    #     kd[12:15] = 5.0
-        
-    #     # Arms (15+): Higher stiffness to hold box
-    #     kp[15:] = 100.0
-    #     kd[15:] = 20.0
-        
-    #     # PD feedback torques
-    #     tau_fb = kp * (q_des - q_curr) - kd * qd_curr
-        
-    #     # Total = feedforward + feedback
-    #     tau_total = tau_ff_actuated + tau_fb
-        
-    #     print(f"Waist FF: {tau_ff_actuated[12:15]}, FB: {tau_fb[12:15]}, Total: {tau_total[12:15]}")
-        
-    #     # Clip to limits
-    #     ctrl_range = self.model.actuator_ctrlrange.copy()
-    #     tau_total = np.clip(tau_total, ctrl_range[:, 0], ctrl_range[:, 1])
-        
-    #     return tau_total
-        
     def get_state(self):
         x = np.zeros(15)
 
@@ -758,32 +595,7 @@ class SimpleMPCBalance:
         ])
         
         return J_contact
-    
-    def get_external_force_jacobian(self):
-        """
-        Get Jacobian for external force application point (box CoM)
-        
-        Returns:
-            J_e: (3, nv) Jacobian mapping joint velocities to box CoM velocity
-        """
-        nv = self.nv
-        
-        # Get box body
-        box_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "box")
-        
-        # Compute Jacobian at box CoM
-        jac_box_trans = np.zeros((3, nv))
-        jac_box_rot = np.zeros((3, nv))  # Not needed for pure force, only for moments
-        
-        # Use body Jacobian (at body's CoM)
-        mujoco.mj_jacBodyCom(self.model, self.data, jac_box_trans, jac_box_rot, box_body_id)
-        
-        # For external force, we only need translational Jacobian
-        J_e = jac_box_trans
-        
-        return J_e
-
-    
+ 
     def get_M_inv(self):
         # Get mass matrix
         M = np.zeros((self.nv, self.nv))
@@ -797,7 +609,7 @@ class SimpleMPCBalance:
         mujoco.mj_fullM(self.model, M, self.data.qM)
         return M
 
-    def step(self, tau):
+    def step_tau(self, tau):
         """Take a step in the environment"""
 
         # Clear forces from previous step
@@ -809,6 +621,38 @@ class SimpleMPCBalance:
         # Step through physics multiple times with same action (frame skip)
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
+
+    def step_cf(self, U):
+        """Take a step in the environment"""
+
+        # Clear forces from previous step
+        self.data.qfrc_applied[:] = 0
+
+        # Set tau=0 for each actuator
+        self.data.ctrl[:] = 0
+
+        # Apply forces DIRECTLY to feet (no WBC)
+        self.apply_contact_force(U)
+        
+        # Step through physics multiple times with same action (frame skip)
+        for _ in range(self.frame_skip):
+            mujoco.mj_step(self.model, self.data)
+
+    def apply_contact_force(self, U):
+        # Apply forces DIRECTLY to feet (no WBC)
+        left_foot_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link")
+        right_foot_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link")
+        
+        # Convert U to full wrenches
+        F_left = np.concatenate([U[0:3], [0], U[6:8]])   # [fx, fy, fz, 0, my, mz]
+        F_right = np.concatenate([U[3:6], [0], U[8:10]]) # [fx, fy, fz, 0, my, mz]
+        
+        # Apply external forces
+        self.data.xfrc_applied[left_foot_body] = F_left
+        self.data.xfrc_applied[right_foot_body] = F_right
+        
+        # Zero joint torques
+        self.data.ctrl[:] = 0
 
     def reset(self, seed=None):
         # Set random seed if provided
@@ -832,7 +676,7 @@ class SimpleMPCBalance:
                 self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
             
             # Sleep to match desired render FPS
-            time.sleep(self.render_dt)
+            # time.sleep(self.render_dt)
             self.viewer.sync()
     
     def close(self):

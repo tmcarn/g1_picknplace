@@ -153,3 +153,141 @@ class WholeBodyController:
         problem.solve(solver=cp.OSQP, verbose=False)
         
         return tau.value
+
+class SimpleWBC:
+    def __init__(self, mpc:SimpleMPCBalance):
+        self.mpc = mpc
+        self.model = mpc.model
+        self.data = mpc.data
+        self.nv = mpc.model.nv
+        self.n_joints = mpc.model.nu
+        
+    def compute_torques(self, U):
+        """
+        Simplest WBC: Solve dynamics for torques
+        
+        Args:
+            q_ddot_des: Desired joint accelerations (nv,)
+            F_contacts: Contact forces [F1, F2, M1, M2] (12,)
+        
+        Returns:
+            tau: Joint torques (n_joints,)
+        """
+        
+        # Get mass matrix
+        M = np.zeros((self.nv, self.nv))
+        mujoco.mj_fullM(self.model, M, self.data.qM)
+        
+        # Get bias forces (Coriolis + gravity)
+        h = self.data.qfrc_bias.copy()
+
+        F_contacts = U[:-3]
+        # Add Mx back to Contact Forces
+        F_contacts = np.concatenate([
+                                        U[0:3],              # Left foot forces [fx1, fy1, fz1]
+                                        U[3:6],              # Right foot forces [fx2, fy2, fz2]
+                                        [0.0], U[6:8],       # Left foot moments [0, my1, mz1]
+                                        [0.0], U[8:10]       # Right foot moments [0, my2, mz2]
+                                    ])
+        
+        F_ext = U[-3:]
+        
+        # Contact forces contribute: J^T·F
+        J_contact = self._get_contact_jacobian()
+        tau_contacts = J_contact.T @ F_contacts
+
+        # External forces contribute: J_e^T F_ext
+        J_external = self.get_external_force_jacobian()
+        tau_external = J_external.T @ F_ext
+
+        q_ddot_des = self.mpc.calculate_q_ddot_des()
+
+        # CHECK MAGNITUDES
+        print(f"\n=== Magnitude Check ===")
+        print(f"Max M: {np.max(np.abs(M)):.2e}")
+        print(f"Max q_ddot_des: {np.max(np.abs(q_ddot_des)):.2e}")
+        print(f"Max h: {np.max(np.abs(h)):.2e}")
+        print(f"Max tau_contacts: {np.max(np.abs(tau_contacts)):.2e}")
+        print(f"Max tau_external: {np.max(np.abs(tau_external)):.2e}")
+            
+        # Solve dynamics for joint torques:
+        # M·q̈_des + h = S_b·τ + J^T·F
+        # S_b·τ = M·q̈_des + h - J^T·F
+        
+        # Selection matrix (maps joint torques to full state)
+        S_b = np.zeros((self.nv, self.n_joints))
+        S_b[6:, :] = np.eye(self.n_joints)
+        
+        # Check intermediate computation
+        Mq = M @ q_ddot_des
+        print(f"M @ q_ddot has Inf: {np.any(np.isinf(Mq))}")
+        print(f"Max M @ q_ddot: {np.max(np.abs(Mq)):.2e}")
+        
+        rhs = Mq - h - tau_contacts - tau_external
+        print(f"rhs has Inf: {np.any(np.isinf(rhs))}")
+        print(f"Max rhs: {np.max(np.abs(rhs)):.2e}")
+
+        # Solve for tau: S_b·τ = rhs
+        # Since S_b = [0; I], we just take elements 6 onward
+        tau = rhs[6:]
+        
+        # Clip to actuator limits
+        tau_min = self.model.actuator_ctrlrange[:, 0]
+        tau_max = self.model.actuator_ctrlrange[:, 1]
+        tau = np.clip(tau, tau_min, tau_max)
+        
+        return tau
+    def _get_contact_jacobian(self):
+        """Debug version"""
+        nv = self.nv
+        
+        jac_left_trans = np.zeros((3, nv))
+        jac_left_rot = np.zeros((3, nv))
+        jac_right_trans = np.zeros((3, nv))
+        jac_right_rot = np.zeros((3, nv))
+        
+        left_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
+        right_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "right_foot")
+        
+        print(f"Left foot site ID: {left_site}")
+        print(f"Right foot site ID: {right_site}")
+        
+        mujoco.mj_jacSite(self.model, self.data, jac_left_trans, jac_left_rot, left_site)
+        mujoco.mj_jacSite(self.model, self.data, jac_right_trans, jac_right_rot, right_site)
+        
+        # Check if Jacobians are reasonable
+        print(f"jac_left_trans has NaN: {np.any(np.isnan(jac_left_trans))}")
+        print(f"jac_left_trans shape: {jac_left_trans.shape}")
+        print(f"jac_left_trans max: {np.max(np.abs(jac_left_trans)):.3f}")
+        print(f"jac_left_trans[2,2] (foot z vs base z): {jac_left_trans[2,2]:.3f}")  # Should be ~1
+        
+        J_contact = np.vstack([jac_left_trans, jac_right_trans, jac_left_rot, jac_right_rot])
+        
+        print(f"J_contact shape: {J_contact.shape}")  # Should be (12, 49)
+        print(f"J_contact rank: {np.linalg.matrix_rank(J_contact)}")  # Should be 12
+        
+        return J_contact
+   
+    def get_external_force_jacobian(self):
+        """
+        Get Jacobian for external force application point (box CoM)
+        
+        Returns:
+            J_e: (3, nv) Jacobian mapping joint velocities to box CoM velocity
+        """
+        nv = self.nv
+        
+        # Get box body
+        box_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        
+        # Compute Jacobian at box CoM
+        jac_box_trans = np.zeros((3, nv))
+        jac_box_rot = np.zeros((3, nv))  # Not needed for pure force, only for moments
+        
+        # Use body Jacobian (at body's CoM)
+        mujoco.mj_jacBodyCom(self.model, self.data, jac_box_trans, jac_box_rot, box_body_id)
+        
+        # For external force, we only need translational Jacobian
+        J_e = jac_box_trans
+        
+        return J_e

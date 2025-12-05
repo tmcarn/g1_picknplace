@@ -316,7 +316,7 @@
                           </body>
                           <!-- Box centered between both hands -->
                           <body name="box" pos="0.175 -0.15 0.0">
-                            <inertial pos="0 0 0" mass="1.0" diaginertia="0.0067 0.0067 0.0067"/>
+                            <inertial pos="0 0 0" mass="5.0" diaginertia="0.0067 0.0067 0.0067"/>
                             <geom name="box_geom" 
                                   type="box" 
                                   size="0.1 0.1 0.1"
@@ -460,6 +460,65 @@
       </body>
     </body>
   </worldbody>
+
+  <equality>
+    <!-- Lock ALL leg joints -->
+    <joint joint1="left_hip_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hip_roll_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hip_yaw_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_knee_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_ankle_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_ankle_roll_joint" polycoef="0 1 0 0 0"/>
+    
+    <joint joint1="right_hip_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hip_roll_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hip_yaw_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_knee_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_ankle_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_ankle_roll_joint" polycoef="0 1 0 0 0"/>
+    
+     <!-- Lock waist -->
+    <joint joint1="waist_yaw_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="waist_roll_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="waist_pitch_joint" polycoef="0 1 0 0 0"/>
+
+    <!-- Lock left arm -->
+    <joint joint1="left_shoulder_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_shoulder_roll_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_shoulder_yaw_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_elbow_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_wrist_roll_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_wrist_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_wrist_yaw_joint" polycoef="0 1 0 0 0"/>
+    
+    <!-- Lock left hand -->
+    <joint joint1="left_hand_thumb_0_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hand_thumb_1_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hand_thumb_2_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hand_middle_0_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hand_middle_1_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hand_index_0_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="left_hand_index_1_joint" polycoef="0 1 0 0 0"/>
+    
+    <!-- Lock right arm -->
+    <joint joint1="right_shoulder_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_shoulder_roll_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_shoulder_yaw_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_elbow_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_wrist_roll_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_wrist_pitch_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_wrist_yaw_joint" polycoef="0 1 0 0 0"/>
+    
+    <!-- Lock right hand -->
+    <joint joint1="right_hand_thumb_0_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hand_thumb_1_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hand_thumb_2_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hand_middle_0_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hand_middle_1_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hand_index_0_joint" polycoef="0 1 0 0 0"/>
+    <joint joint1="right_hand_index_1_joint" polycoef="0 1 0 0 0"/>
+  </equality>
+
   <actuator>
     <!-- ALL joints use motor (torque) control -->
     
@@ -534,6 +593,15 @@
       0 1.05 0 0 0 0 0
       0.2 -0.2 0 1.28 0 0 0
       0 -1.05 0 0 0 0 0
+      "
+
+      qvel="
+      0 0 0 0 0 0
+      0 0 0 0 0 0
+      0 0 0 0 0 0
+      0 0 0 0 0 0
+      0 0 0 0 0 0 0 0 0 0 0 0 0
+      0 0 0 0 0 0 0 0 0 0 0 0 
       "
       ctrl="
       0 0 0 0 0 0
