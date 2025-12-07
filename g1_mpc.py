@@ -99,7 +99,7 @@ class SimpleMPCBalance:
         # Environmental Constants
         self.norm_vec = np.array([0, 0, 1])
         self.gravity = np.array([0,0,-9.81])
-        self.box_mass = 5 #kg
+        self.box_mass = 2 #kg
 
         # Use initial state as desired state
         self.x_desired = self.get_state()
@@ -107,9 +107,9 @@ class SimpleMPCBalance:
 
         # Constraint Parameters
         self.mu = 0.7
-        self.F_min = 25.0   # Minimum normal force (N) - keeps contact
+        self.F_min = 0.0   # Minimum normal force (N) - keeps contact
         self.F_max = 500.0  # Maximum normal force (N) - robot/ground limits
-        self.M_max = 50.0   # Maximum moment (N⋅m)
+        self.M_max = 9.0   # Maximum moment (N⋅m)
 
         # Render 
         self.viewer = None
@@ -213,19 +213,6 @@ class SimpleMPCBalance:
             cost += cp.quad_form(x_error, self.Q)
             cost += cp.quad_form(u[k], self.R)
 
-            # total_fz = u[k][2] + u[k][5]
-            # cost += 100000.0 * cp.square(total_fz - required_fz)
-
-            # # Fx and Fy Bounds
-            # constraints.append(u[k][0] >= -50)   # Fx limits (was probably unbounded)
-            # constraints.append(u[k][0] <= 50)
-            # constraints.append(u[k][1] >= -50)   # Fy limits
-            # constraints.append(u[k][1] <= 50)
-
-            # # Moment Bounds
-            # constraints.append(u[k][6:10] >= -20)  # Tighter moment limits
-            # constraints.append(u[k][6:10] <= 20)
-
             # ===== DYNAMIC CONSTRAINTS =====
             x_dot = A @ x[k] + B @ u[k]
             constraints.append(x[k+1] == x[k] + self.dt * x_dot)
@@ -259,8 +246,20 @@ class SimpleMPCBalance:
             # ===== EXTERNAL FORCE CONSTRAINTS =====
             constraints.append(u[k][10:] == self.gravity * self.box_mass)
 
+            # ===== MOMENT BOUNDING CONSTRAINTS =====
+            constraints.append(u[k][6] >= -self.M_max)
+            constraints.append(u[k][6] <= self.M_max)
+            constraints.append(u[k][7] >= -self.M_max)
+            constraints.append(u[k][7] <= self.M_max)
+            constraints.append(u[k][8] >= -self.M_max)
+            constraints.append(u[k][8] <= self.M_max)
+            constraints.append(u[k][9] >= -self.M_max)
+            constraints.append(u[k][9] <= self.M_max)
+
+
+
         
-        # Terminal cost
+        # TERMINAL COST
         x_error_final = x[self.horizon] - self.x_desired
         cost += cp.quad_form(x_error_final, self.Q * 10) # Terminal cost is emphasized
         
