@@ -316,7 +316,7 @@
                           </body>
                           <!-- Box centered between both hands -->
                           <body name="box" pos="0.175 -0.15 0.0">
-                            <inertial pos="0 0 0" mass="2" diaginertia="0.0067 0.0067 0.0067"/>
+                            <inertial pos="0 0 0" mass="1.0" diaginertia="0.0067 0.0067 0.0067"/>
                             <geom name="box_geom" 
                                   type="box" 
                                   size="0.1 0.1 0.1"

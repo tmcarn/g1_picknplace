@@ -38,11 +38,10 @@ for i in range(10_000):
     U = mpc.compute_optimal_control() # Determine Optimal Contact Forces
     tau = wbc.compute_torques(U) # Determine Optimal Joint Torque from Contact Forces
     
-    if i%10 ==0:
+    if i%1 == 0:
         log_step(U, tau)
 
     mpc.step_tau(tau)
-    # mpc.step_cf(U)
 
     mpc.render()
 

@@ -11,6 +11,9 @@ import time
 
 class SimpleMPCBalance:
     def __init__(self, mpc_frq=50, render_mode="human", render_fps=30):
+
+        self.R_b = None
+
         self.xml_path = "unitree_g1/g1_with_box_torque_ctrl.xml"
         
         # Select a graphics backend for the viewer
@@ -99,11 +102,10 @@ class SimpleMPCBalance:
         # Environmental Constants
         self.norm_vec = np.array([0, 0, 1])
         self.gravity = np.array([0,0,-9.81])
-        self.box_mass = 2 #kg
+        self.box_mass = 1.0 #kg
 
         # Use initial state as desired state
         self.x_desired = self.get_state()
-        print(self.x_desired)
 
         # Constraint Parameters
         self.mu = 0.7
@@ -120,7 +122,9 @@ class SimpleMPCBalance:
         self.print_model_info()
         self.contact_data = self.get_contacts()
 
-        self.reset_noise = 0.01
+        # Reset the simulation
+        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
 
     def state_transition_model(self, x):
         '''
@@ -141,13 +145,13 @@ class SimpleMPCBalance:
         s_psi = np.sin(yaw)
         
         # Roll Not Included because M_x is ignored
-        R_b = np.array([
+        self.R_b = np.array([
             [c_theta * c_psi,  -s_psi,  0],
             [c_theta * s_psi,   c_psi,  0],
             [-s_theta,          0,      1]
         ])
 
-        A[:3, 6:9] = R_b
+        A[:3, 6:9] = self.R_b
         A[3:6, 9:12] = np.eye(3)
         A[9:12, 12:] = np.eye(3)
 
@@ -201,8 +205,6 @@ class SimpleMPCBalance:
         # Cost Function
         cost = 0
         constraints = []
-
-        required_fz = 45 * 9.81
 
         # Initial state constraint
         constraints.append(x[0] == x0)
@@ -551,20 +553,22 @@ class SimpleMPCBalance:
         
         robot_com = weighted_pos / total_mass
         return robot_com
-
-    def get_com_jacobian(self):
+    
+    def get_orientation_jacobian(self):
         """
-        CoM position Jacobian
-        Maps: q̇ → ṗ_c (linear velocity of CoM)
+        Get base orientation Jacobian
+        Maps: q̇ → ω (angular velocity)
+        
+        Returns:
+            J_orient: (3, nv) Jacobian
         """
         nv = self.model.nv
-        jac_com = np.zeros((3, nv))
-        mujoco.mj_jacSubtreeCom(self.model, self.data, jac_com, 0)
-    
-        return jac_com 
-
-    def get_omega_jacobian(self):
-        pass
+        jac_orient = np.zeros((3, nv))
+        
+        # For floating base, angular velocity is DOFs 3:6
+        jac_orient[:, 3:6] = np.eye(3)
+        
+        return jac_orient
 
     def get_contact_jacobian(self):
         """
