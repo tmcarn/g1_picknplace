@@ -106,12 +106,13 @@ class SimpleMPCBalance:
 
         # Use initial state as desired state
         self.x_desired = self.get_state()
+        self.x_desired[5] = 0.720
 
         # Constraint Parameters
         self.mu = 0.7
-        self.F_min = 0.0   # Minimum normal force (N) - keeps contact
+        self.F_min = 10.0   # Minimum normal force (N) - keeps contact
         self.F_max = 500.0  # Maximum normal force (N) - robot/ground limits
-        self.M_max = 9.0   # Maximum moment (N⋅m)
+        self.M_max = 10.0   # Maximum moment (N⋅m)
 
         # Render 
         self.viewer = None
@@ -195,8 +196,11 @@ class SimpleMPCBalance:
     
     def compute_optimal_control(self):
         x0 = self.get_state()
-
-        A, B = self.state_transition_model(x0)
+        A_c, B_c = self.state_transition_model(x0) # Gets the continous state transition matrices based on x_0
+        
+        # Convert to Discrete Time
+        A_d = np.eye(A_c.shape[0]) + (A_c * self.dt)
+        B_d = B_c * self.dt
 
         # Decision variables for each step in horizon
         x = [cp.Variable(15) for _ in range(self.horizon + 1)] # Included initial state
@@ -216,8 +220,7 @@ class SimpleMPCBalance:
             cost += cp.quad_form(u[k], self.R)
 
             # ===== DYNAMIC CONSTRAINTS =====
-            x_dot = A @ x[k] + B @ u[k]
-            constraints.append(x[k+1] == x[k] + self.dt * x_dot)
+            constraints.append(x[k+1] == A_d @ x[k] + B_d @ u[k])
 
             # ===== FOOT 1 CONSTRAINTS =====
             # Normal force limits: F_min <= F1z <= F_max
