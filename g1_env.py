@@ -1,28 +1,77 @@
+import os
 import numpy as np
-import gymnasium as gym
-from gymnasium.spaces import Box
 import mujoco
 import mujoco.viewer
-import os
-import time
+
+from scipy.spatial.transform import Rotation as R
 
 
-class G1Env(gym.Env):
-    def __init__(self, render_mode='human', render_fps=30, policy_feq=50, ): # 50 Hz 
-        super().__init__()
-        
-        xml_path = "unitree_g1/g1_mocap_29dof_with_hands.xml"
+class MJG1Env:
+    '''
+    Controls the Actions of G1 and the resulting States 
+    '''
+
+    def __init__(self, render_mode="human", render_fps=30):
+        self.xml_path = "unitree_g1/g1_with_box_torque_ctrl.xml"
         
         # Select a graphics backend for the viewer
         os.environ.setdefault("MUJOCO_GL", "glfw")
         
         # Load model and create data
-        self.model = mujoco.MjModel.from_xml_path(xml_path)
+        self.model = mujoco.MjModel.from_xml_path(self.xml_path)
         self.data = mujoco.MjData(self.model)
 
+        # Load the standing keyframe
+        keyframe_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
+        self.data.qpos[:] = self.model.key_qpos[keyframe_id]
+        self.data.qvel[:] = self.model.key_qvel[keyframe_id]
+
+        self.data.qvel[:] = 0 # Sets all initial joint velocities to zero
+
+        # Reset the simulation
+        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
+
+        mujoco.mj_forward(self.model, self.data) # Update Step
+
+        print("="*50)
+        print("Successfully loaded in 'stand' keyframe as initial position")
+        print("="*50)
+
+        self.print_model_info()
+
+        # Environmental Constants
+        self.g = 9.81
+        self.grav_vec = np.array([0,0,-9.81])
+
+        _, self.box_mass = self.get_obj_com()
+        _, self.g1_mass = self.get_g1_com()
+        self.total_mass = self.g1_mass + self.box_mass
+
+        # Initial state
+        self.init_qpos = self.data.qpos.copy()
+        self.init_qvel = self.data.qvel.copy()
+
+        # Set Desired state to be equal to Initial State
+        self.x_desired = self.get_state()
+
+        # Constraints Parameters
+        # TODO: Set these limits based on something more concrete
+        self.mu = 0.7
+        self.F_min = self.total_mass * self.g * 0.05   # Minimum normal force (N) - keeps contact
+        self.F_max = self.total_mass * self.g * 10  # Maximum normal force (N) - robot/ground limits
+        self.M_max = 10.0   # Maximum moment (N⋅m)
+
+        # RENDER CONFIG
+        self.viewer = None
+        self.render_mode = render_mode
+        self.render_fps = render_fps
+        self.render_dt = 1.0 / self.render_fps
+             
+    def print_model_info(self):
         # Print model info
         print(f"\n{'='*50}")
-        print(f"Model: {xml_path}")
+        print(f"Model: {self.xml_path}")
         print(f"{'='*50}")
         print(f"Number of joints: {self.model.njnt}")
         print(f"Number of DOF: {self.model.nv}")
@@ -48,299 +97,313 @@ class G1Env(gym.Env):
         print(f"Physics timestep: {self.model.opt.timestep} seconds")
         print(f"Physics frequency: {1/self.model.opt.timestep} Hz")
         # Print Controls Info
-        self.frame_skip = int((1 / self.model.opt.timestep) / policy_feq)
+        self.frame_skip = int((1 / self.model.opt.timestep) / self.mpc_frq)
         print(f"Frame skip: {self.frame_skip}")
         print(f"Control frequency: {1/(self.model.opt.timestep * self.frame_skip)} Hz")
 
-        # Get dimensions
-        self.nu = self.model.nu  # Number of actuators
-        self.nq = self.model.nq  # Number of position coordinates
-        self.nv = self.model.nv  # Number of velocity coordinates
-
-        # Get actuator limits
-        action_low = self.model.actuator_ctrlrange[:, 0]
-        action_high = self.model.actuator_ctrlrange[:, 1]
-
-        # Define action space (position targets)
-        self.action_space = Box(
-            low=action_low,
-            high=action_high,
-            dtype=np.float64
-        )
-        print(f"Action Space:{action_high.shape}")
-
-        obs_low, obs_high = self.get_obs_limits()
-
-        self.observation_space = Box(
-            low=obs_low,
-            high=obs_high,
-            dtype=np.float64
-        )
-
-        print(f"Observation Space:{obs_high.shape}")
-
-        # Load the standing keyframe
-        keyframe_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
-        self.data.qpos[:] = self.model.key_qpos[keyframe_id]
-        self.data.qvel[:] = self.model.key_qvel[keyframe_id]
-        mujoco.mj_forward(self.model, self.data)
-        print("Loaded in 'stand' keyframe as initial position")
-    
-
-        # Initial state
-        self.init_qpos = self.data.qpos.copy()
-        self.init_qvel = self.data.qvel.copy()
-
-        # Perturbation Noise
-        self.reset_noise = 0.01
-
-        # Reward Parameters
-        self.min_reward_height = 0.75 # meters
-        self.min_term_height = 0.5
-        
-        term_tilt_angle = 30 # degrees
-        self.term_tilt_tresh = self.calculate_tilt_thresh(term_tilt_angle)
-
-        # Environment Constants
-        self.up_vector = np.array([0, 0, 1])
-        self.gravity = np.array([0,0,-9.81])
-        self.box_mass = 10 #kg
-
-        # Render 
-        self.viewer = None
-        self.render_mode = render_mode
-        self.render_fps = render_fps
-        self.render_dt = 1.0 / self.render_fps
-
-    
-    def calculate_tilt_thresh(self, tilt_degrees):
-        tilt_rad = np.radians(tilt_degrees)
-        threshold = np.cos(tilt_rad)
-        return threshold
-
-    def get_obs(self):
-        """Get observation from current state."""
-        obs = np.concatenate([
-            self.data.qpos.copy(),
-            self.data.qvel.copy()
-        ])
-        return obs.astype(np.float64)
-    
-    def get_obs_limits(self):
-        """Get observation space limits from model."""
-        
-        # Torso position: no strict limits (can move anywhere)
-        pos_low = np.full(3, -np.inf)
-        pos_high = np.full(3, np.inf)
-        
-        # Quaternion: normalized, so each component in [-1, 1]
-        quat_low = np.full(4, -1.0)
-        quat_high = np.full(4, 1.0)
-        
-        # Joint positions: skip free joint (index 0)
-        joint_pos_low = self.model.jnt_range[1:, 0]  # Shape: (n_joints-1,)
-        joint_pos_high = self.model.jnt_range[1:, 1]
-        
-        # Velocities - need to match the structure of get_obs()
-        # Torso linear velocity (3)
-        vel_low = np.full(3, -10.0)  # m/s
-        vel_high = np.full(3, 10.0)
-        
-        # Torso angular velocity (3)
-        ang_vel_low = np.full(3, -10.0)  # rad/s
-        ang_vel_high = np.full(3, 10.0)
-        
-        # Joint velocities: skip free joint DOFs (first 6)
-        # Free joint has 6 velocity DOFs: 3 linear + 3 angular
-        joint_vel_low = np.full(self.nv - 6, -20.0)  # rad/s
-        joint_vel_high = np.full(self.nv - 6, 20.0)
-        
-        # Concatenate all limits - MUST match order in get_obs()
-        obs_low = np.concatenate([
-            pos_low,           # 3
-            quat_low,          # 4
-            joint_pos_low,     # nq - 7
-            vel_low,           # 3
-            ang_vel_low,       # 3
-            joint_vel_low,     # nv - 6
-        ]).astype(np.float64)
-        
-        obs_high = np.concatenate([
-            pos_high,          # 3
-            quat_high,         # 4
-            joint_pos_high,    # nq - 7
-            vel_high,          # 3
-            ang_vel_high,      # 3
-            joint_vel_high,    # nv - 6
-        ]).astype(np.float64)
-        
-        return obs_low, obs_high
-
-    def calculate_reward(self):
-        '''
-        Simple Reward Policy for Humanoid Ballancing
-        Reward:
-        - Torso Height (Z position)
-        - Upright Torso Orientation (distance beween normal vector and torso z axis)
-
-        Cost:
-        - Penalize Expensive Actions
-        '''
-        # Torso height (penalize falling)
-        height = self.data.qpos[2]
-        height_reward = 1.5 if height > self.min_reward_height else 0.0
-
-        upright_reward = 1.5 * self.get_tilt()
-
-        # Control Cost (Penalizes Large Actions)
-        ctrl_cost = -1 * np.sum(np.square(self.data.ctrl))
-
-        total_reward = height_reward + upright_reward + ctrl_cost
-        
-        return total_reward
-    
-    def get_tilt(self):
-        # Upright orientation
-        torso_quat = self.data.qpos[3:7]
-        rotation_matrix = np.zeros(9)
-        mujoco.mju_quat2Mat(rotation_matrix, torso_quat)
-        torso_z_axis = rotation_matrix[6:9]
-        return np.dot(torso_z_axis, self.up_vector)
-    
-    def apply_extern_force(self):
-        box_force = self.gravity * self.box_mass # F = ma
-        force_per_hand = box_force / 2
-
-        hand_names = ["left_wrist_yaw_link", "right_wrist_yaw_link"]
-        for hand_name in hand_names:
-            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, hand_name)
+    def get_g1_com(self):
+            """
+            Compute full robot COM excluding the carried box
+            """
+            box_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "box")
             
-            # Apply downward force (negative z)
-
-            # Get hand position in world frame
-            hand_pos = self.data.xpos[body_id].copy()
+            total_mass = 0.0
+            weighted_pos = np.zeros(3)
             
-            # Apply force in world frame at hand position
-            mujoco.mj_applyFT(
-                self.model,
-                self.data,
-                force_per_hand,      # Force in WORLD frame
-                np.zeros(3),         # No torque
-                hand_pos,            # Point of application (world coords)
-                body_id,             # Body ID
-                self.data.qfrc_applied  # Output array
-            )
-
-    def check_contacts(self):
-        # Check all active contacts
-        for i in range(self.data.ncon):
-            contact = self.data.contact[i]
+            # Iterate through all bodies
+            for body_id in range(self.model.nbody):
+                # Skip world body (id=0) and box body
+                if body_id == 0 or body_id == box_id:
+                    continue
+                
+                body_mass = self.model.body_mass[body_id]
+                body_pos = self.data.xpos[body_id]
+                
+                weighted_pos += body_mass * body_pos
+                total_mass += body_mass
             
-            # Get bodies in contact
-            geom1 = contact.geom1
-            geom2 = contact.geom2
-            body1 = self.model.geom_bodyid[geom1]
-            body2 = self.model.geom_bodyid[geom2]
-            
-            # Check if ground contact (one geom should be ground)
-            geom1_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom1)
-            geom2_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom2)
+            robot_com = weighted_pos / total_mass
+            return robot_com, total_mass
 
-            print(f"Contact {i}: Between {geom1_name} and {geom2_name}")
-            
-
-    def terminate(self):
-        # Torso height (penalize falling)
-        height = self.data.qpos[2]
-        if height < self.min_term_height:
-            return True
-        
-        if self.get_tilt() < self.term_tilt_tresh:
-            return True
-        
-        return False
-
-    def reset(self, seed=None, options=None):
-        """Reset the environment"""
-        super().reset(seed=seed)
-
-        # Set random seed if provided
-        if seed is not None:
-            np.random.seed(seed)
-        
-        # Reset to initial state with small random perturbations
-        self.data.qpos[:] = self.init_qpos + np.random.uniform(
-            -self.reset_noise, self.reset_noise, self.model.nq
-        )
-        self.data.qvel[:] = self.init_qvel + np.random.uniform(
-            -self.reset_noise, self.reset_noise, self.model.nv
-        )
-        
-        mujoco.mj_forward(self.model, self.data)
-        
-        obs = self.get_obs()
-        info = {}
-        
-        return obs, info
+    def get_obj_com(self):
+        box_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "box")
+        obj_com = self.data.xpos[box_id]
+        obj_mass = self.model.body_mass[box_id]
+        return obj_com, obj_mass
     
-    def step(self, action):
+    def get_state(self):
+        x = np.zeros(15)
+
+        # Theta
+        torso_quat = self.data.qpos[3:7]  # Quaternion [w, x, y, z] in MuJoCo
+
+        rotation = R.from_quat(torso_quat, scalar_first=True)
+        roll, pitch, yaw = rotation.as_euler('ZYX', degrees=False)
+        
+        x[0:3] = [roll, pitch, yaw]
+        
+        # p_c
+        p_c = self.get_g1_com()
+        x[3:6] = p_c
+        
+        # omega
+        omega = self.data.qvel[3:6]  # Body frame angular velocity
+        x[6:9] = omega
+
+        # p_c_dot
+        p_c_dot = self.compute_robot_com_velocity()
+        x[9:12] = p_c_dot
+
+        # g
+        x[12:] = self.gravity
+
+        return x
+
+    def compute_robot_com_velocity(self):
+        """
+        Compute robot COM velocity excluding the box
+        
+        Returns:
+            p_c_dot: robot COM velocity [vx, vy, vz]
+        """
+        total_mass = 0.0
+        weighted_vel = np.zeros(3)
+        
+        for body_id in range(self.model.nbody):
+            # Skip world body and box
+            if body_id == 0 or body_id == "box":
+                continue
+            
+            body_mass = self.model.body_mass[body_id]
+            
+            # Get body velocity
+            # MuJoCo computes body velocities in data after forward kinematics
+            body_vel = self.data.cvel[body_id, 3:6]
+            
+            weighted_vel += body_mass * body_vel
+            total_mass += body_mass
+        
+        robot_com_vel = weighted_vel / total_mass
+        return robot_com_vel
+    
+    def step_tau(self, tau):
         """Take a step in the environment"""
-
-        self.check_contacts()
 
         # Clear forces from previous step
         self.data.qfrc_applied[:] = 0
 
-        # Clip actions to valid range
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        
-        # Apply action (as control signal)
-        self.data.ctrl[:] = action
-
-        self.apply_extern_force()
+        # Set tau for each actuator
+        self.data.ctrl[:] = tau
         
         # Step through physics multiple times with same action (frame skip)
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
+
+    def step_cf(self, U):
+        """Take a step in the environment"""
+
+        # Clear forces from previous step
+        self.data.qfrc_applied[:] = 0
+
+        # Set tau=0 for each actuator
+        self.data.ctrl[:] = 0
+
+        # Apply forces DIRECTLY to feet (no WBC)
+        self.apply_contact_force(U)
         
-        # Get observation
-        obs = self.get_obs()
+        # Step through physics multiple times with same action (frame skip)
+        for _ in range(self.frame_skip):
+            mujoco.mj_step(self.model, self.data)
+
+    def apply_contact_force(self, U):
+        # Apply forces DIRECTLY to feet (no WBC)
+        left_foot_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link")
+        right_foot_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link")
         
-        # Calculate reward
-        reward = self.calculate_reward()
+        # Convert U to full wrenches
+        F_left = np.concatenate([U[0:3], [0], U[6:8]])   # [fx, fy, fz, 0, my, mz]
+        F_right = np.concatenate([U[3:6], [0], U[8:10]]) # [fx, fy, fz, 0, my, mz]
         
-        # Check termination conditions
-        terminate = self.terminate()
-        truncated = False
+        # Apply external forces
+        self.data.xfrc_applied[left_foot_body] = F_left
+        self.data.xfrc_applied[right_foot_body] = F_right
         
-        info = {
-            'height': self.data.qpos[2],
-            'reward': reward,
-        }
-        
-        return obs, reward, terminate, truncated, info
-    
-    def render(self):
-        """Render the environment."""
-        if self.render_mode == "human":
-            if self.viewer is None:
-                self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+        # Zero joint torques
+        self.data.ctrl[:] = 0
+
+    def get_contacts(self):
+        contact_data = defaultdict(lambda: {
+        'positions': [],
+        'forces': [],
+        'moments':[],
+        'num_contacts': 0,
+        })
+
+        # Check all active contacts
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+                
+            # Get bodies in contact
+            geom1 = contact.geom1
+            geom2 = contact.geom2
+
+            body1 = self.model.geom_bodyid[geom1]
+            body2 = self.model.geom_bodyid[geom2]
             
-            # Sleep to match desired render FPS
-            time.sleep(self.render_dt)
-            self.viewer.sync()
-        elif self.render_mode == "rgb_array":
-            if self.viewer is None:
-                self.viewer = mujoco.Renderer(self.model, self._render_height, self._render_width)
-            self.viewer.update_scene(self.data)
-            return self.viewer.render()
+            body_1name = self.model.body(body1).name
+            body_2name = self.model.body(body2).name
+
+            if body_1name == 'world':
+                link_name = body_2name
+
+            elif body_2name == 'world':
+                link_name = body_1name
+
+            else: # Only concerned with Foot - World Contacts
+                continue
+
+            # Get force vector
+            force = np.zeros(6)
+            mujoco.mj_contactForce(self.model, self.data, i, force)
+            force_lin = force[:3]
+            moment = force[3:]
+
+            # Transform to world
+            contact_frame = contact.frame.reshape(3, 3)
+            force_world = contact_frame @ force_lin
+            moment_world = contact_frame @ moment
+            force_mag = np.linalg.norm(force_world)
+            moment_mag = np.linalg.norm(moment_world)
+
+            # Skip Weak Contacts
+            if force_mag > 25 or moment_mag > 10: # Newtons
+                # Accumulate data
+                contact_data[link_name]['positions'].append(contact.pos.copy())
+                contact_data[link_name]['forces'].append(force_world)
+                contact_data[link_name]['moments'].append(moment_world)
+                contact_data[link_name]['num_contacts'] += 1
+
+        return contact_data
+ 
+    def get_inertia_tensor(self):
+        M = np.zeros((self.model.nv, self.model.nv))
+        mujoco.mj_fullM(self.model, M, self.data.qM)
+        
+        # Extract rotational inertia (first 3x3 block corresponds to angular DOFs)
+        # For floating base: DOFs are [trans_x, trans_y, trans_z, rot_x, rot_y, rot_z, joint1, ...]
+        I_G = M[3:6, 3:6]  # Angular part of mass matrix
+        
+        return I_G
     
+    def get_distance_vectors(self):
+        p_c = self.get_g1_com()
+
+        contact_dict = self.get_contacts()
+
+        f1_contact_points = contact_dict["left_ankle_roll_link"]["positions"]
+
+        if len(f1_contact_points) > 0:
+            # Has contacts - use mean
+            f1_center_point = np.mean(f1_contact_points, axis=0)
+        else:
+            # No contacts - use body position as fallback
+            left_foot_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link")
+            f1_center_point = self.data.xpos[left_foot_id].copy()
+
+        r1 = f1_center_point - p_c # Moment arm from CoM to contact point 1
+        
+
+        f2_contact_points = contact_dict["right_ankle_roll_link"]["positions"]
+
+        if len(f2_contact_points) > 0:
+            # Has contacts - use mean
+            f2_center_point = np.mean(f2_contact_points, axis=0)
+        else:
+            # No contacts - use body position as fallback
+            right_foot_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link")
+            f2_center_point = self.data.xpos[right_foot_id].copy()
+
+        r2 = f2_center_point - p_c # Moment arm from CoM to contact point 2
+
+        f_e_center_point = self.get_obj_com()
+        r_e = f_e_center_point - p_c
+
+        return np.array([r1, r2, r_e])
+
+    def skew_symmetric(self, v):
+        """
+        Create skew-symmetric matrix from 3D vector
+        
+        Args:
+            v: array-like, shape (3,)
+        
+        Returns:
+            v_cross: ndarray, shape (3, 3)
+        """
+        return np.array([
+            [0,     -v[2],  v[1]],
+            [v[2],   0,    -v[0]],
+            [-v[1],  v[0],  0   ]
+        ])
+    
+    def get_orientation_jacobian(self):
+        """
+        Get base orientation Jacobian
+        Maps: q̇ → ω (angular velocity)
+        
+        Returns:
+            J_orient: (3, nv) Jacobian
+        """
+        nv = self.model.nv
+        jac_orient = np.zeros((3, nv))
+        
+        # For floating base, angular velocity is DOFs 3:6
+        jac_orient[:, 3:6] = np.eye(3)
+        
+        return jac_orient
+
+    def get_contact_jacobian(self):
+        """
+        Get stacked contact Jacobian for both feet
+        Returns J_contact: (12, nv) for [F1, F2, M1, M2]
+        """
+        nv = self.nv
+        
+        # Foot Jacobians
+        jac_left_trans = np.zeros((3, nv))
+        jac_left_rot = np.zeros((3, nv))
+        jac_right_trans = np.zeros((3, nv))
+        jac_right_rot = np.zeros((3, nv))
+        
+        left_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
+        right_foot_site = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "right_foot")
+        
+        mujoco.mj_jacSite(self.model, self.data, jac_left_trans, jac_left_rot, left_foot_site)
+        mujoco.mj_jacSite(self.model, self.data, jac_right_trans, jac_right_rot, right_foot_site)
+        
+        # Stack: [F1(3), F2(3), M1(3), M2(3)] = 12D
+        J_contact = np.vstack([
+            jac_left_trans,   # F1
+            jac_right_trans,  # F2
+            jac_left_rot,     # M1
+            jac_right_rot     # M2
+        ])
+        
+        return J_contact
+ 
+    def render(self):
+            """Render the environment."""
+            if self.render_mode == "human":
+                if self.viewer is None:
+                    self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                
+                # Sleep to match desired render FPS
+                # time.sleep(self.render_dt)
+                self.viewer.sync()
+
     def close(self):
         """Clean up resources."""
         if self.viewer is not None:
             if self.render_mode == "human":
                 self.viewer.close()
             self.viewer = None
-
-
-# g1 = G1Env()

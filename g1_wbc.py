@@ -172,7 +172,6 @@ class SimpleWBC:
         M_inv = np.linalg.inv(M)
 
         J_pinv = self.compute_dynamic_pinv(J_tasks, M_inv)  # (nv, 6)
-        # J_pinv = np.linalg.pinv(J_tasks)
         q_ddot_des = J_pinv @ self.x_ddot_des  # (nv, 6) @ (6, 1)
 
         return q_ddot_des
